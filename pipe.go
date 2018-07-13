@@ -589,35 +589,21 @@ func uniPipeClientConnect() {
 			access = syscall.GENERIC_READ
 		}
 		response := uniPipeFilePairing{}
-	createLoop:
-		for {
-			h, err := createFile(
-				request.pipePath,
-				access,
-				0,
-				sa,
-				syscall.OPEN_EXISTING,
-				cSECURITY_SQOS_PRESENT,
-				0,
-			)
-			if err == nil {
-				response.file = os.NewFile(uintptr(h), "pipe")
-				request.listenerReturnChan <- response
-				break createLoop
-			}
-			syscall.CloseHandle(h)
-			if err != cERROR_PIPE_BUSY {
-				response.err = err
-				request.listenerReturnChan <- response
-				break createLoop
-			}
-			err = waitNamedPipe(request.pipePath, uniPipeWaitPeriod)
-			if err != cERROR_SEM_TIMEOUT {
-				response.err = err
-				request.listenerReturnChan <- response
-				break createLoop
-			}
+		h, err := createFile(
+			request.pipePath,
+			access,
+			0,
+			sa,
+			syscall.OPEN_EXISTING,
+			cSECURITY_SQOS_PRESENT,
+			0,
+		)
+		if err == nil {
+			response.file = os.NewFile(uintptr(h), "pipe")
+		} else {
+			response.err = err
 		}
+		request.listenerReturnChan <- response
 	}
 }
 
