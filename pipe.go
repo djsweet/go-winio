@@ -461,7 +461,6 @@ type uniPipeFilePairing struct {
 
 type uniPipeListenAcceptRequest struct {
 	pipePath           string
-	pipeHandle         *win32File
 	reading            bool
 	callerReturnChan   chan uniPipeFilePairing
 	listenerReturnChan chan uniPipeFilePairing
@@ -483,15 +482,9 @@ func unidirectionalPipeInit() {
 func PipeSyncReadAsyncWrite() (r *os.File, w WriteCloserSyncer, e error) {
 	uniPipeInitOnce.Do(unidirectionalPipeInit)
 	path := fmt.Sprintf(uniPipePathFormat, genPath())
-	p, err := createUnidirectionalPipeServerReading(false, path)
-	if err != nil {
-		e = err
-		return
-	}
 	callReturn := make(chan uniPipeFilePairing)
 	uniPipeListenAcceptChan <- uniPipeListenAcceptRequest{
 		pipePath:         path,
-		pipeHandle:       p,
 		reading:          false,
 		callerReturnChan: callReturn,
 	}
@@ -508,15 +501,9 @@ func PipeSyncReadAsyncWrite() (r *os.File, w WriteCloserSyncer, e error) {
 func PipeAsyncReadSyncWrite() (r io.ReadCloser, w *os.File, e error) {
 	uniPipeInitOnce.Do(unidirectionalPipeInit)
 	path := fmt.Sprintf(uniPipePathFormat, genPath())
-	p, err := createUnidirectionalPipeServerReading(true, path)
-	if err != nil {
-		e = err
-		return
-	}
 	callReturn := make(chan uniPipeFilePairing)
 	uniPipeListenAcceptChan <- uniPipeListenAcceptRequest{
 		pipePath:         path,
-		pipeHandle:       p,
 		reading:          true,
 		callerReturnChan: callReturn,
 	}
@@ -555,18 +542,23 @@ func genPath() string {
 func uniPipeListenAccept() {
 	for {
 		request := <-uniPipeListenAcceptChan
+		pipeHandle, err := createUnidirectionalPipeServerReading(request.reading, request.pipePath)
+		if err != nil {
+			request.callerReturnChan <- uniPipeFilePairing{err: err}
+			continue
+		}
 		request.listenerReturnChan = make(chan uniPipeFilePairing)
 		uniPipeClientConnectChan <- request
-		err := connectPipe(request.pipeHandle)
+		err = connectPipe(pipeHandle)
 		if err != nil {
-			request.pipeHandle.Close()
+			pipeHandle.Close()
 			<-request.listenerReturnChan
 			request.callerReturnChan <- uniPipeFilePairing{err: err}
 			continue
 		}
 		pairing := <-request.listenerReturnChan
 		if pairing.err == nil {
-			pairing.pipe = &win32Pipe{win32File: request.pipeHandle, path: request.pipePath}
+			pairing.pipe = &win32Pipe{win32File: pipeHandle, path: request.pipePath}
 		}
 		request.callerReturnChan <- pairing
 	}
