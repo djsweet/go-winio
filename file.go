@@ -265,6 +265,12 @@ func (f *win32File) Flush() error {
 	return syscall.FlushFileBuffers(f.handle)
 }
 
+// Sync is equivalent to Flush, but is provided for consistency between
+// the os.File interface and this interface.
+func (f *win32File) Sync() error {
+	return f.Flush()
+}
+
 func (d *deadlineHandler) set(deadline time.Time) error {
 	d.setLock.Lock()
 	defer d.setLock.Unlock()
