@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/quick"
 	"time"
 	"unsafe"
 )
@@ -512,5 +513,95 @@ func TestMessageReadMode(t *testing.T) {
 	}
 	if !bytes.Equal(msg, vmsg) {
 		t.Fatalf("expected %s: %s", msg, vmsg)
+	}
+}
+
+func TestSyncReadAsyncWrite(t *testing.T) {
+	sender := func(send []byte, into WriteCloserSyncer) {
+		sent := 0
+		for sent < len(send) {
+			n, err := into.Write(send[sent:])
+			if err != nil {
+				panic(err)
+			}
+			sent += n
+		}
+		into.Sync()
+		into.Close()
+	}
+	receiver := func(from *os.File, into chan<- []byte) {
+		var (
+			buf [256]byte
+			ret []byte
+		)
+		for {
+			n, err := from.Read(buf[:])
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				panic(err)
+			}
+			ret = bytes.Join([][]byte{ret, buf[:n]}, []byte{})
+		}
+		into <- ret
+	}
+	testImpl := func(send []byte) bool {
+		readPipe, writePipe, err := PipeSyncReadAsyncWrite()
+		if err != nil {
+			panic(err)
+		}
+		returnChan := make(chan []byte)
+		go sender(send, writePipe)
+		go receiver(readPipe, returnChan)
+		recv := <-returnChan
+		return bytes.Equal(recv, send)
+	}
+	if err := quick.Check(testImpl, nil); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestAsyncReadSyncWrite(t *testing.T) {
+	sender := func(send []byte, into *os.File) {
+		sent := 0
+		for sent < len(send) {
+			n, err := into.Write(send[sent:])
+			if err != nil {
+				panic(err)
+			}
+			sent += n
+		}
+		into.Sync()
+		into.Close()
+	}
+	receiver := func(from io.ReadCloser, into chan<- []byte) {
+		var (
+			buf [256]byte
+			ret []byte
+		)
+		for {
+			n, err := from.Read(buf[:])
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				panic(err)
+			}
+			ret = bytes.Join([][]byte{ret, buf[:n]}, []byte{})
+		}
+		into <- ret
+	}
+	testImpl := func(send []byte) bool {
+		readPipe, writePipe, err := PipeAsyncReadSyncWrite()
+		if err != nil {
+			panic(err)
+		}
+		returnChan := make(chan []byte)
+		go sender(send, writePipe)
+		go receiver(readPipe, returnChan)
+		recv := <-returnChan
+		return bytes.Equal(recv, send)
+	}
+	if err := quick.Check(testImpl, nil); err != nil {
+		t.Error(err)
 	}
 }
