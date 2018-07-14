@@ -3,10 +3,14 @@
 package winio
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,6 +31,8 @@ const (
 	cERROR_PIPE_CONNECTED = syscall.Errno(535)
 	cERROR_SEM_TIMEOUT    = syscall.Errno(121)
 
+	cPIPE_ACCESS_INBOUND           = 0x1
+	cPIPE_ACCESS_OUTBOUND          = 0x2
 	cPIPE_ACCESS_DUPLEX            = 0x3
 	cFILE_FLAG_FIRST_PIPE_INSTANCE = 0x80000
 	cSECURITY_SQOS_PRESENT         = 0x100000
@@ -37,8 +43,10 @@ const (
 	cPIPE_UNLIMITED_INSTANCES = 255
 
 	cNMPWAIT_USE_DEFAULT_WAIT = 0
+	cPIPE_WAIT                = 0
 	cNMPWAIT_NOWAIT           = 1
 
+	cPIPE_TYPE_BYTE    = 0
 	cPIPE_TYPE_MESSAGE = 4
 
 	cPIPE_READMODE_MESSAGE = 2
@@ -222,16 +230,27 @@ func makeServerPipeHandle(path string, securityDescriptor []byte, c *PipeConfig,
 	if c.MessageMode {
 		mode |= cPIPE_TYPE_MESSAGE
 	}
+	return createNamedPipeWithSd(path, securityDescriptor, flags, mode, cPIPE_UNLIMITED_INSTANCES, c)
+}
 
+func createNamedPipeWithSd(path string, sd []byte, flags, mode, ninst uint32, c *PipeConfig) (syscall.Handle, error) {
 	sa := &syscall.SecurityAttributes{}
 	sa.Length = uint32(unsafe.Sizeof(*sa))
-	if securityDescriptor != nil {
-		len := uint32(len(securityDescriptor))
+	if len := uint32(len(sd)); len > 0 {
 		sa.SecurityDescriptor = localAlloc(0, len)
 		defer localFree(sa.SecurityDescriptor)
-		copy((*[0xffff]byte)(unsafe.Pointer(sa.SecurityDescriptor))[:], securityDescriptor)
+		copy((*[0xffff]byte)(unsafe.Pointer(sa.SecurityDescriptor))[:], sd)
 	}
-	h, err := createNamedPipe(path, flags, mode, cPIPE_UNLIMITED_INSTANCES, uint32(c.OutputBufferSize), uint32(c.InputBufferSize), 0, sa)
+	h, err := createNamedPipe(
+		path,
+		flags,
+		mode,
+		ninst,
+		uint32(c.OutputBufferSize),
+		uint32(c.InputBufferSize),
+		0,
+		sa,
+	)
 	if err != nil {
 		return 0, &os.PathError{Op: "open", Path: path, Err: err}
 	}
@@ -433,4 +452,194 @@ func (l *win32PipeListener) Close() error {
 
 func (l *win32PipeListener) Addr() net.Addr {
 	return pipeAddress(l.path)
+}
+
+// There is a use-case for being able to force data immediately through
+// a pipe, but the Go standard library doesn't export Sync() as an interface.
+// So we'll make our own here.
+
+type WriteCloserSyncer interface {
+	io.WriteCloser
+	Sync() error
+}
+
+const (
+	uniPipeInputBufferSize  int32  = 4096
+	uniPipeOutputBufferSize int32  = 4096
+	uniPipeWaitPeriod       uint32 = 8 // 8ms or 125Hz
+	uniPipePathFormat              = "\\\\.\\pipe\\%s"
+)
+
+type uniPipeFilePairing struct {
+	pipe *win32Pipe
+	file *os.File
+	err  error
+}
+
+type uniPipeListenAcceptRequest struct {
+	pipePath           string
+	reading            bool
+	callerReturnChan   chan uniPipeFilePairing
+	listenerReturnChan chan uniPipeFilePairing
+}
+
+var (
+	uniPipeListenAcceptChan  chan uniPipeListenAcceptRequest
+	uniPipeClientConnectChan chan uniPipeListenAcceptRequest
+	uniPipeInitOnce          sync.Once
+)
+
+func unidirectionalPipeInit() {
+	uniPipeListenAcceptChan = make(chan uniPipeListenAcceptRequest)
+	uniPipeClientConnectChan = make(chan uniPipeListenAcceptRequest)
+	go uniPipeListenAccept()
+	go uniPipeClientConnect()
+}
+
+func PipeSyncReadAsyncWrite() (r *os.File, w WriteCloserSyncer, e error) {
+	uniPipeInitOnce.Do(unidirectionalPipeInit)
+	path := fmt.Sprintf(uniPipePathFormat, genPath())
+	callReturn := make(chan uniPipeFilePairing)
+	uniPipeListenAcceptChan <- uniPipeListenAcceptRequest{
+		pipePath:         path,
+		reading:          false,
+		callerReturnChan: callReturn,
+	}
+	pairing := <-callReturn
+	if pairing.err != nil {
+		e = pairing.err
+		return
+	}
+	r = pairing.file
+	w = pairing.pipe
+	return
+}
+
+func PipeAsyncReadSyncWrite() (r io.ReadCloser, w *os.File, e error) {
+	uniPipeInitOnce.Do(unidirectionalPipeInit)
+	path := fmt.Sprintf(uniPipePathFormat, genPath())
+	callReturn := make(chan uniPipeFilePairing)
+	uniPipeListenAcceptChan <- uniPipeListenAcceptRequest{
+		pipePath:         path,
+		reading:          true,
+		callerReturnChan: callReturn,
+	}
+	pairing := <-callReturn
+	if pairing.err != nil {
+		e = pairing.err
+		return
+	}
+	r = pairing.pipe
+	w = pairing.file
+	return
+}
+
+// This is UUIDv4 according to IETF RFC 4122
+
+func genPath() string {
+	var intermediate [16]byte
+	_, err := rand.Read(intermediate[:])
+	if err != nil {
+		panic(err)
+	}
+	intermediate[6] &= 0x0f
+	intermediate[6] |= 0x40
+	intermediate[8] &= 0x3f
+	intermediate[8] |= 0x80
+	return fmt.Sprintf(
+		"%s-%s-%s-%s-%s",
+		hex.EncodeToString(intermediate[:4]),
+		hex.EncodeToString(intermediate[4:6]),
+		hex.EncodeToString(intermediate[6:8]),
+		hex.EncodeToString(intermediate[8:10]),
+		hex.EncodeToString(intermediate[10:]),
+	)
+}
+
+func uniPipeListenAccept() {
+	for {
+		request := <-uniPipeListenAcceptChan
+		pipeHandle, err := createUnidirectionalPipeServerReading(request.reading, request.pipePath)
+		if err != nil {
+			request.callerReturnChan <- uniPipeFilePairing{err: err}
+			continue
+		}
+		request.listenerReturnChan = make(chan uniPipeFilePairing)
+		uniPipeClientConnectChan <- request
+		err = connectPipe(pipeHandle)
+		if err != nil {
+			pipeHandle.Close()
+			<-request.listenerReturnChan
+			request.callerReturnChan <- uniPipeFilePairing{err: err}
+			continue
+		}
+		pairing := <-request.listenerReturnChan
+		if pairing.err == nil {
+			pairing.pipe = &win32Pipe{win32File: pipeHandle, path: request.pipePath}
+		}
+		request.callerReturnChan <- pairing
+	}
+}
+
+func uniPipeClientConnect() {
+	// Make sure all the clients are inheritable, we're often passing
+	// these off to child processes instead of anonymous pipes
+	sa := &syscall.SecurityAttributes{
+		InheritHandle: 1,
+	}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
+	for {
+		request := <-uniPipeClientConnectChan
+		var access uint32
+		// Flip the reading state: it declares what the server is doing
+		if request.reading {
+			access = syscall.GENERIC_WRITE
+		} else {
+			access = syscall.GENERIC_READ
+		}
+		response := uniPipeFilePairing{}
+		h, err := createFile(
+			request.pipePath,
+			access,
+			0,
+			sa,
+			syscall.OPEN_EXISTING,
+			cSECURITY_SQOS_PRESENT,
+			0,
+		)
+		if err == nil {
+			response.file = os.NewFile(uintptr(h), "pipe")
+		} else {
+			response.err = err
+		}
+		request.listenerReturnChan <- response
+	}
+}
+
+func createUnidirectionalPipeServerReading(read bool, path string) (*win32File, error) {
+	cfg := &PipeConfig{
+		SecurityDescriptor: "",
+		OutputBufferSize:   uniPipeOutputBufferSize,
+		InputBufferSize:    uniPipeInputBufferSize,
+	}
+	var flags uint32 = cFILE_FLAG_FIRST_PIPE_INSTANCE |
+		syscall.FILE_FLAG_OVERLAPPED
+	if read {
+		flags |= cPIPE_ACCESS_INBOUND
+	} else {
+		flags |= cPIPE_ACCESS_OUTBOUND
+	}
+	var mode uint32 = cPIPE_TYPE_BYTE |
+		cPIPE_WAIT |
+		cPIPE_REJECT_REMOTE_CLIENTS
+	h, err := createNamedPipeWithSd(path, nil, flags, mode, 1, cfg)
+	if err != nil {
+		return nil, err
+	}
+	f, err := makeWin32File(h)
+	if err != nil {
+		syscall.CloseHandle(h)
+		return nil, err
+	}
+	return f, nil
 }
