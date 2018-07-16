@@ -524,7 +524,7 @@ func TestMessageReadMode(t *testing.T) {
 	var vmsg []byte
 	for {
 		n, err := c.Read(ch)
-		if err == io.EOF {
+		if err == io.EOF || err == cERROR_PIPE_NOT_CONNECTED {
 			break
 		}
 		if err != nil {
