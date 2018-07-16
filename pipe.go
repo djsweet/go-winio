@@ -229,7 +229,23 @@ func DialPipe(path string, timeout *time.Duration) (net.Conn, error) {
 
 	var flags uint32
 	err = getNamedPipeInfo(h, &flags, nil, nil, nil)
-	if err != nil {
+	// If we manage to get cERROR_PIPE_NOT_CONNECTED at this stage,
+	// the pipe server opened and closed the pipe connection during
+	// this call. At this point, nothing can be done with the named pipe,
+	// so the message mode doesn't particularly matter. We'll return
+	// win32MessageBytePipe, because it is a superset of win32Pipe.
+	if err == cERROR_PIPE_NOT_CONNECTED {
+		f, err := makeWin32File(h)
+		if err != nil {
+			syscall.Close(h)
+			return nil, err
+		}
+		return &win32MessageBytePipe{
+			win32Pipe: win32Pipe{win32File: f, path: path},
+			readEOF: true,
+			writeClosed: true,
+		}, nil
+	} else if err != nil {
 		return nil, err
 	}
 

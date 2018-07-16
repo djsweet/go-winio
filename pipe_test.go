@@ -466,19 +466,7 @@ func TestConnectRace(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// disconnectNamedPipe can counter-race the client
-			// by causing getNamedPipeInfo to abort early. Since
-			// we're testing the client racing the server, and not
-			// the other way around, we'll be polite and give the
-			// client the chance to Close first.
-			go func(p net.Conn) {
-				var into [1]byte
-				_, err := p.Read(into[:])
-				if err != io.EOF {
-					t.Fatal(err)
-				}
-				p.Close()
-			}(s)
+			s.Close()
 		}
 	}()
 

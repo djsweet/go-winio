@@ -207,6 +207,10 @@ func (f *win32File) asyncIo(c *ioOperation, d *deadlineHandler, bytes uint32, er
 			if f.closing.isSet() {
 				err = ErrFileClosed
 			}
+		} else if err == cERROR_PIPE_NOT_CONNECTED {
+			// Translate ERROR_PIPE_NOT_CONNECTED to io.EOF;
+			// this makes sense for net.Conn consumers.
+			err = io.EOF
 		}
 	case <-timeout:
 		cancelIoEx(f.handle, &c.o)
