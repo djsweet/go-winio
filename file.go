@@ -33,6 +33,7 @@ func (b *atomicBool) swap(new bool) bool {
 const (
 	cFILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 1
 	cFILE_SKIP_SET_EVENT_ON_HANDLE        = 2
+	cERROR_PIPE_NOT_CONNECTED             = syscall.Errno(233)
 )
 
 var (

@@ -3,6 +3,7 @@ package winio
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -466,7 +467,19 @@ func TestConnectRace(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			s.Close()
+			// disconnectNamedPipe can counter-race the client
+			// by causing getNamedPipeInfo to abort early. Since
+			// we're testing the client racing the server, and not
+			// the other way around, we'll be polite and give the
+			// client the chance to Close first.
+			go func(p net.Conn) {
+				var into [1]byte
+				_, err := p.Read(into[:])
+				if err != io.EOF {
+					t.Fatal(err)
+				}
+				p.Close()
+			}(s)
 		}
 	}()
 
@@ -485,6 +498,7 @@ func TestMessageReadMode(t *testing.T) {
 
 	l, err := ListenPipe(testPipeName, &PipeConfig{MessageMode: true})
 	if err != nil {
+		fmt.Fprint(os.Stderr, "Wait can't listen?\n")
 		t.Fatal(err)
 	}
 	defer l.Close()
@@ -523,7 +537,7 @@ func TestMessageReadMode(t *testing.T) {
 	var vmsg []byte
 	for {
 		n, err := c.Read(ch)
-		if err == io.EOF {
+		if err == io.EOF || err == cERROR_PIPE_NOT_CONNECTED {
 			break
 		}
 		if err != nil {

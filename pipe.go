@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -97,7 +96,6 @@ func (f *win32Pipe) Close() error {
 	if f.listener == nil {
 		return f.win32File.Close()
 	}
-	f.listener.nextLock.Lock()
 	var (
 		listenerOpen bool
 		nextPipe     *win32File
@@ -108,11 +106,9 @@ func (f *win32Pipe) Close() error {
 	default:
 		listenerOpen = true
 	}
-	nextPipe = (*win32File)(atomic.LoadPointer(&f.listener.nextPipe))
 	// If the nextPipe is not nil, this means the listenerRoutine managed
 	// to successfully fill it. We don't need to touch it in this case.
-	if nextPipe != nil || !listenerOpen {
-		f.listener.nextLock.Unlock()
+	if !listenerOpen {
 		return f.win32File.Close()
 	}
 	handle := f.win32File.nilHandleReturning()
@@ -120,8 +116,18 @@ func (f *win32Pipe) Close() error {
 	// Simply reconnecting the pipe will keep the instance open, meaning
 	// we keep our name in the pipe namespace.
 	nextPipe = reuseWin32File(handle)
-	atomic.StorePointer(&f.listener.nextPipe, unsafe.Pointer(nextPipe))
-	f.listener.nextLock.Unlock()
+	if !atomic.CompareAndSwapPointer(&f.listener.nextPipe, nil, unsafe.Pointer(nextPipe)) {
+		nextPipe.Close()
+	}
+	// Check to see if the listener closed after we swapped in the replacement pipe
+	// If so, close it.
+	select {
+	case <- f.listener.doneCh:
+		nextPipe.Close()
+	default:
+		// Pass, the nextPipe was swapped in before listener closing,
+		// so it's the responsibility of the listener now.
+	}
 	return nil
 }
 
@@ -258,7 +264,6 @@ type win32PipeListener struct {
 	acceptCh           chan (chan acceptResponse)
 	closeCh            chan int
 	doneCh             chan int
-	nextLock           sync.Mutex
 }
 
 func makeServerPipeHandle(path string, securityDescriptor []byte, c *PipeConfig, first bool) (syscall.Handle, error) {
@@ -362,14 +367,17 @@ func (l *win32PipeListener) listenerRoutine() {
 			if nextPipe == nil {
 				responseCh <- acceptResponse{nil, nextErr}
 
-				l.nextLock.Lock()
-				nextPipe = (*win32File)(atomic.LoadPointer(&l.nextPipe))
-				if nextPipe == nil {
-					nextPipe, nextErr = l.makeServerPipe()
-					atomic.StorePointer(&l.nextPipe, unsafe.Pointer(nextPipe))
-					// l.nextPipe, nextErr = l.makeServerPipe()
+				nextPipe, nextErr = l.makeServerPipe()
+				if nextErr == nil {
+					didIt := atomic.CompareAndSwapPointer(
+						&l.nextPipe,
+						nil,
+						unsafe.Pointer(nextPipe),
+					)
+					if !didIt {
+						nextPipe.Close()
+					}
 				}
-				l.nextLock.Unlock()
 				continue
 			}
 			for {
@@ -383,22 +391,20 @@ func (l *win32PipeListener) listenerRoutine() {
 			closed = err == ErrPipeListenerClosed
 			p := nextPipe
 			if !closed {
-				l.nextLock.Lock()
+				// At this point, l.nextPipe wasn't nil, so no pipe instances
+				// attempted to donate their handle to us. We can safely
+				// overwrite l.nextPipe without any concerns as a result.
 				nextPipe, nextErr = l.makeServerPipe()
 				atomic.StorePointer(&l.nextPipe, unsafe.Pointer(nextPipe))
-				l.nextLock.Unlock()
 			}
 			responseCh <- acceptResponse{p, err}
 		}
 	}
 	// Notify Close() and Accept() callers that the handle has been closed.
 	close(l.doneCh)
-	l.nextLock.Lock()
-	defer l.nextLock.Unlock()
-	if l.nextPipe != nil {
-		nextPipe := (*win32File)(atomic.LoadPointer(&l.nextPipe))
+	nextPipe := (*win32File)(atomic.LoadPointer(&l.nextPipe))
+	if nextPipe != nil {
 		nextPipe.Close()
-		atomic.StorePointer(&l.nextPipe, nil)
 	}
 }
 
