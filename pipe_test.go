@@ -3,7 +3,6 @@ package winio
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -498,7 +497,6 @@ func TestMessageReadMode(t *testing.T) {
 
 	l, err := ListenPipe(testPipeName, &PipeConfig{MessageMode: true})
 	if err != nil {
-		fmt.Fprint(os.Stderr, "Wait can't listen?\n")
 		t.Fatal(err)
 	}
 	defer l.Close()

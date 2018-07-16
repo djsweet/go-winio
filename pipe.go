@@ -101,7 +101,7 @@ func (f *win32Pipe) Close() error {
 		nextPipe     *win32File
 	)
 	select {
-	case <- f.listener.doneCh:
+	case <- f.listener.iDoneCh:
 		// pass, default for bool is false
 	default:
 		listenerOpen = true
@@ -122,7 +122,7 @@ func (f *win32Pipe) Close() error {
 	// Check to see if the listener closed after we swapped in the replacement pipe
 	// If so, close it.
 	select {
-	case <- f.listener.doneCh:
+	case <- f.listener.iDoneCh:
 		nextPipe.Close()
 	default:
 		// Pass, the nextPipe was swapped in before listener closing,
@@ -263,7 +263,14 @@ type win32PipeListener struct {
 	config             PipeConfig
 	acceptCh           chan (chan acceptResponse)
 	closeCh            chan int
-	doneCh             chan int
+	// iDoneCh is used for the _internals_, where we tell all the service
+	// goroutines like connectServerPipe and all the working win32Pipe.Close()
+	// calls that we're finished.
+	iDoneCh            chan int
+	// xDoneCh blocks the win32PipeListener.Close() caller until the listener
+	// is sure that it has closed its own handles.
+	xDoneCh            chan int
+	// Note that you can still race the listener with win32Pipe.Close() calls.
 }
 
 func makeServerPipeHandle(path string, securityDescriptor []byte, c *PipeConfig, first bool) (syscall.Handle, error) {
@@ -400,12 +407,14 @@ func (l *win32PipeListener) listenerRoutine() {
 			responseCh <- acceptResponse{p, err}
 		}
 	}
-	// Notify Close() and Accept() callers that the handle has been closed.
-	close(l.doneCh)
+	// Notify win32Pipe.Close() callers that the handle has been closed.
+	close(l.iDoneCh)
 	nextPipe := (*win32File)(atomic.LoadPointer(&l.nextPipe))
 	if nextPipe != nil {
 		nextPipe.Close()
 	}
+	// Notify win32PipeListener.Close() and Accept() callers that the handle has been closed.
+	close(l.xDoneCh)
 }
 
 // PipeConfig contain configuration for the pipe listener.
@@ -455,7 +464,8 @@ func ListenPipe(path string, c *PipeConfig) (net.Listener, error) {
 		config:             *c,
 		acceptCh:           make(chan (chan acceptResponse)),
 		closeCh:            make(chan int),
-		doneCh:             make(chan int),
+		iDoneCh:            make(chan int),
+		xDoneCh:            make(chan int),
 	}
 	go l.listenerRoutine()
 	return l, nil
@@ -495,7 +505,7 @@ func (l *win32PipeListener) Accept() (net.Conn, error) {
 			}, nil
 		}
 		return &win32Pipe{win32File: response.f, path: l.path, listener: l}, nil
-	case <-l.doneCh:
+	case <-l.xDoneCh:
 		return nil, ErrPipeListenerClosed
 	}
 }
@@ -503,8 +513,8 @@ func (l *win32PipeListener) Accept() (net.Conn, error) {
 func (l *win32PipeListener) Close() error {
 	select {
 	case l.closeCh <- 1:
-		<-l.doneCh
-	case <-l.doneCh:
+		<-l.xDoneCh
+	case <-l.xDoneCh:
 	}
 	return nil
 }
